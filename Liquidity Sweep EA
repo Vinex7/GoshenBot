@@ -1,0 +1,199 @@
+//+------------------------------------------------------------------+
+//|                                              LiquiditySweep.mq5  |
+//|                                  Expert Advisor for MT5         |
+//+------------------------------------------------------------------+
+#property copyright "2025"
+#property version   "1.30"
+#property strict
+#property description "Liquidity Sweep Low breakout with multi-timeframe RSI, equity drawdown controls, adaptive RR, advanced MM"
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//--- input parameters
+input double   RiskPercent           = 1.0;     // Base risk per trade (%)
+input double   MinRiskPercent        = 0.5;     // Min risk when ATR high (%)
+input double   MaxRiskPercent        = 2.0;     // Max risk when ATR low (%)
+input int      MaxPositions          = 5;       // Max concurrent positions
+input int      SweepLookback         = 21;      // Bars to look back for sweep
+input double   VolumeSpikeMult       = 1.5;     // Volume spike multiplier
+input int      RsiPeriod             = 14;      // RSI period (LTF)
+input int      RsiLookback           = 5;       // Bars for LTF RSI divergence
+input int      HTFRsiPeriod          = 14;      // RSI period on HTF
+input double   HTFRsiThreshold       = 50.0;    // Minimum HTF RSI value for entry
+input int      AtrPeriod             = 14;      // ATR period
+input double   BaseRewardRatio       = 1.5;     // Base RR
+input double   MinRewardRatio        = 1.0;     // Min RR when volatility low
+input double   MaxRewardRatio        = 3.0;     // Max RR when volatility high
+input ENUM_TIMEFRAMES HTF           = PERIOD_H4; // Higher timeframe for trend & RSI filter
+input int      HTFMaperiod           = 50;      // MA period on HTF
+input int      CooldownMinutes       = 60;      // Minutes between trades
+input bool     UseKellyMM            = false;   // Enable Kelly position sizing
+input double   KellyFraction         = 0.5;     // Fraction of Kelly
+input double   MaxDrawdownPercent    = 10.0;    // Max equity drawdown (%)
+
+//--- globals
+datetime last_trade_time = 0;
+double   equityPeak       = 0;
+
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   Print("LiquiditySweep EA v1.30 initialized");
+   equityPeak = AccountInfoDouble(ACCOUNT_EQUITY);
+   EventSetTimer(60);
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   EventKillTimer();
+  }
+
+//+------------------------------------------------------------------+
+void OnTimer()
+  {
+   static datetime lastTime=0;
+   datetime cur = iTime(_Symbol, Period(), 0);
+   if(cur == lastTime) return;
+   lastTime = cur;
+   ExecuteStrategy();
+  }
+
+//+------------------------------------------------------------------+
+void ExecuteStrategy()
+  {
+   // equity drawdown control
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   equityPeak = MathMax(equityPeak, equity);
+   double drawdown = (equityPeak - equity) / equityPeak * 100.0;
+   if(drawdown > MaxDrawdownPercent)
+     {
+      PrintFormat("Drawdown %.2f%% > Max %.2f%%. Trading halted.", drawdown, MaxDrawdownPercent);
+      return;
+     }
+
+   // time filter
+   int h = TimeHour(TimeCurrent()); if(h < 6 || h > 21) return;
+   // cooldown
+   if(TimeCurrent() - last_trade_time < CooldownMinutes * 60) return;
+   // data length
+   if(Bars(_Symbol, Period()) < SweepLookback + RsiLookback + 5) return;
+
+   // HTF trend & RSI filter
+   double htfMA    = iMA(_Symbol, HTF, HTFMaperiod, 0, MODE_SMA, PRICE_CLOSE, 0);
+   double htfPrice = iClose(_Symbol, HTF, 0);
+   if(htfPrice < htfMA) return;
+   double htfRsi   = iRSI(_Symbol, HTF, HTFRsiPeriod, PRICE_CLOSE, 0);
+   if(htfRsi < HTFRsiThreshold) return;
+
+   // LTF data arrays
+   int    total = SweepLookback + 5;
+   double high[], low[], close[], vol[];
+   ArraySetAsSeries(high,true); ArraySetAsSeries(low,true);
+   ArraySetAsSeries(close,true); ArraySetAsSeries(vol,true);
+   CopyHigh(_Symbol, Period(), 0, total, high);
+   CopyLow(_Symbol, Period(), 0, total, low);
+   CopyClose(_Symbol, Period(), 0, total, close);
+   CopyVolume(_Symbol, Period(), 0, total, vol);
+
+   // sweep low detection
+   int idx = -1; double priceLow = 0;
+   for(int i = 1; i <= SweepLookback; i++)
+     if(low[i] < low[i+1] && low[i] < low[i-1]) { idx = i; priceLow = low[i]; break; }
+   if(idx < 1) return;
+
+   // confirmation LTF candles
+   if(!IsBull(3) || !IsBull(2) || !IsBull(1)) return;
+   // volume spike
+   double avgV = 0; for(int j = idx+1; j <= idx+RsiPeriod; j++) avgV += vol[j]; avgV /= RsiPeriod;
+   if(vol[idx] < avgV * VolumeSpikeMult) return;
+   // LTF RSI divergence
+   if(!CheckRSIDiv(idx)) return;
+
+   // ATR & adaptive RR
+   double atr = iATR(_Symbol, Period(), AtrPeriod, 0);
+   double rr  = BaseRewardRatio;
+   if(atr > 0)
+      rr = MathMax(MinRewardRatio, MathMin(MaxRewardRatio, BaseRewardRatio * (atr/_Point/10)));
+
+   // adaptive risk percent
+   double scaledRisk = RiskPercent;
+   if(atr > 0)
+      scaledRisk = MathMax(MinRiskPercent, MathMin(MaxRiskPercent, RiskPercent * (1.0/(atr/_Point/10))));
+
+   // entry, SL, TP
+   double entry = close[idx-3];
+   double sl    = priceLow;
+   double pips  = (entry - sl) / _Point;
+   if(pips <= 0) return;
+
+   double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
+   double money    = balance * (scaledRisk / 100.0);
+   double lot      = money / (pips * _Point * SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE));
+   // Kelly MM override
+   if(UseKellyMM)
+     {
+      double winRate = 0.55, avgWin = rr, avgLoss = 1;
+      double k = (winRate/avgLoss - (1-winRate)/avgWin);
+      lot *= (KellyFraction * k);
+     }
+   lot = NormalizeDouble(lot, 2);
+   if(lot <= 0) return;
+
+   double tp = entry + pips * _Point * rr;
+   if(CountPos() >= MaxPositions) return;
+
+   // place order
+   trade.SetStopLossPrice(sl);
+   trade.SetTakeProfitPrice(tp);
+   if(trade.Buy(lot, NULL, entry, sl, tp))
+      last_trade_time = TimeCurrent();
+
+   // manage open trades
+   ManageAll();
+  }
+
+//+------------------------------------------------------------------+
+bool IsBull(int sh)
+  { return iClose(_Symbol, Period(), sh) > iOpen(_Symbol, Period(), sh); }
+
+//+------------------------------------------------------------------+
+bool CheckRSIDiv(int idx)
+  {
+   int len = idx + RsiLookback + 1;
+   double rsiArr[];
+   ArraySetAsSeries(rsiArr, true);
+   CopyBuffer(iRSI(_Symbol, Period(), RsiPeriod, PRICE_CLOSE), 0, 0, len, rsiArr);
+   double r1 = rsiArr[idx], r2 = rsiArr[idx + RsiLookback];
+   double p1 = iLow(_Symbol, Period(), idx), p2 = iLow(_Symbol, Period(), idx + RsiLookback);
+   return (p2 < p1 && r2 > r1);
+  }
+
+//+------------------------------------------------------------------+
+int CountPos()
+  {
+   int cnt = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+     if(PositionGetSymbol(i) == _Symbol) cnt++;
+   return cnt;
+  }
+
+//+------------------------------------------------------------------+
+void ManageAll()
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(PositionGetSymbol(i) != _Symbol) continue;
+      ulong ticket = PositionGetTicket(i);
+      double op    = PositionGetDouble(POSITION_PRICE_OPEN);
+      double cp    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double sl    = PositionGetDouble(POSITION_SL);
+      double pips  = sl > 0 ? (sl - op) / _Point : 0;
+      double prof  = (cp - op) / _Point;
+      if(pips > 0 && prof >= pips)               trade.PositionClosePartial(ticket, 0.5);
+      if(pips > 0 && prof >= 2 * pips)           trade.PositionModify(ticket, op, 0);
+     }
+  }
+//+------------------------------------------------------------------+
